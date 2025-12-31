@@ -20,6 +20,75 @@ from .device_utils import get_device_list, soft_empty_cache_multigpu
 from .model_management_mgpu import multigpu_memory_log, force_full_system_cleanup
 
 
+def _load_list_item4(item):
+    """
+    Normalize ComfyUI ModelPatcher._load_list() entries to a 4-tuple:
+      (module_size, module_name, module_object, params)
+
+    Some versions/custom patchers may return 5+ fields (e.g. size, index, name, module, params, ...).
+    This helper finds the first string as name and first torch.nn.Module as module.
+    """
+    if not isinstance(item, (tuple, list)):
+        raise TypeError(f"_load_list entry must be tuple/list, got: {type(item)!r}")
+    if len(item) < 2:
+        raise ValueError(f"_load_list entry too short (len={len(item)}): {item!r}")
+
+    module_size = item[0]
+    rest = list(item[1:])
+
+    module_name = None
+    for x in rest:
+        if isinstance(x, str):
+            module_name = x
+            break
+
+    module_object = None
+    for x in rest:
+        if isinstance(x, torch.nn.Module):
+            module_object = x
+            break
+
+    remaining = []
+    for x in rest:
+        if module_object is not None and x is module_object:
+            continue
+        if module_name is not None and x == module_name:
+            continue
+        remaining.append(x)
+
+    params = None
+    for x in reversed(remaining):
+        if isinstance(x, (dict, list, tuple, set)):
+            params = x
+            break
+
+    if params is None and len(remaining) > 0:
+        params = remaining[-1]
+
+    if module_name is None:
+        if len(item) >= 3 and isinstance(item[2], str):
+            module_name = item[2]
+        else:
+            module_name = item[1]
+
+    if module_object is None:
+        if len(item) >= 4 and isinstance(item[3], torch.nn.Module):
+            module_object = item[3]
+        elif len(item) >= 3 and isinstance(item[2], torch.nn.Module):
+            module_object = item[2]
+        else:
+            module_object = item[2] if len(item) >= 3 else None
+
+    return module_size, module_name, module_object, params
+
+
+def _call_with_supported_kwargs(fn, *args, **kwargs):
+    sig = inspect.signature(fn)
+    if not any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+        kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return fn(*args, **kwargs)
+
+
 def register_patched_safetensor_modelpatcher():
     """Register and patch the ModelPatcher for distributed safetensor loading"""
     from comfy.model_patcher import wipe_lowvram_weight, move_weight_functions
@@ -212,7 +281,7 @@ def register_patched_safetensor_modelpatcher():
             
             if not hasattr(inner_model, "_distorch_v2_meta"):
                 logger.debug(f"[DISTORCH_SKIP] ModelPatcher=0x{mp_id:x} inner_model=0x{inner_model_id:x} type={type(inner_model).__name__} - no metadata, using standard loading")
-                result = original_partially_load(self, device_to, extra_memory, force_patch_weights)
+                result = _call_with_supported_kwargs(original_partially_load, self, device_to, extra_memory=extra_memory, full_load=full_load, force_full_load=full_load, force_patch_weights=force_patch_weights, **kwargs)
                 if hasattr(self, '_distorch_block_assignments'):
                     del self._distorch_block_assignments
                 return result
@@ -240,8 +309,11 @@ def register_patched_safetensor_modelpatcher():
             
             model_original_dtype = comfy.utils.weight_dtype(self.model.state_dict())
             high_precision_loras = getattr(self.model, "_distorch_high_precision_loras", True)
-            loading = self._load_list()
-            loading.sort(reverse=True)
+
+            loading_raw = self._load_list()
+            loading = [_load_list_item4(x) for x in loading_raw]
+            loading.sort(key=lambda x: x[0], reverse=True)
+
             for module_size, module_name, module_object, params in loading:
                 if not unpatch_weights and hasattr(module_object, "comfy_patched_weights") and module_object.comfy_patched_weights == True:
                     block_target_device = device_assignments['block_assignments'].get(module_name, device_to)
@@ -321,8 +393,18 @@ def _extract_clip_head_blocks(raw_block_list, compute_device):
     head_memory = 0
     block_assignments = {}
     
-    for module_size, module_name, module_object, params in raw_block_list:
-        if any(kw in module_name.lower() for kw in head_keywords):
+    for entry in raw_block_list:
+        module_size, module_name, module_object, params = _load_list_item4(entry)
+
+        module_name_l = module_name.lower() if isinstance(module_name, str) else ""
+        module_type_l = type(module_object).__name__.lower() if module_object is not None else ""
+
+        is_head = any(kw in module_name_l for kw in head_keywords)
+        if not is_head and module_object is not None:
+            if isinstance(module_object, torch.nn.Embedding) or "embedding" in module_type_l:
+                is_head = True
+
+        if is_head:
             head_blocks.append((module_size, module_name, module_object, params))
             block_assignments[module_name] = compute_device
             head_memory += module_size
@@ -422,7 +504,8 @@ def analyze_safetensor_loading(model_patcher, allocations_string, is_clip=False)
     memory_by_type = defaultdict(int)
     total_memory = 0
 
-    raw_block_list = model_patcher._load_list()
+    raw_block_list_raw = model_patcher._load_list()
+    raw_block_list = [_load_list_item4(x) for x in raw_block_list_raw]
     total_memory = sum(module_size for module_size, _, _, _ in raw_block_list)
 
     MIN_BLOCK_THRESHOLD = total_memory * 0.0001
@@ -431,10 +514,9 @@ def analyze_safetensor_loading(model_patcher, allocations_string, is_clip=False)
 
     # CLIP-specific: Extract head blocks and get pre-assignments
     head_memory = 0
-    block_assignments = {}
+    locked_block_assignments = {}
     if is_clip:
-        head_blocks, distributable_raw, block_assignments, head_memory = \
-            _extract_clip_head_blocks(raw_block_list, compute_device)
+        head_blocks, distributable_raw, locked_block_assignments, head_memory = _extract_clip_head_blocks(raw_block_list, compute_device)
         logger.info(f"[MultiGPU DisTorch V2 CLIP] Preserving {len(head_blocks)} head layer(s) ({head_memory/(1024**2):.2f} MB) on compute device: {compute_device}")
     else:
         distributable_raw = raw_block_list
@@ -476,7 +558,7 @@ def analyze_safetensor_loading(model_patcher, allocations_string, is_clip=False)
     # Distribute blocks sequentially from the tail of the model
 
     device_assignments = {device: [] for device in DEVICE_RATIOS_DISTORCH.keys()}
-    block_assignments = {}
+    block_assignments = dict(locked_block_assignments)
 
     # Create a memory quota for each donor device based on its calculated allocation.
     donor_devices = [d for d in sorted_devices]
@@ -580,7 +662,8 @@ def parse_memory_string(mem_str):
 
 def calculate_fraction_from_byte_expert_string(model_patcher, byte_str):
     """Convert byte allocation string (e.g. 'cuda:1,4gb;cpu,*') to fractional VRAM allocation string respecting device order and byte quotas."""
-    raw_block_list = model_patcher._load_list()
+    raw_block_list_raw = model_patcher._load_list()
+    raw_block_list = [_load_list_item4(x) for x in raw_block_list_raw]
     total_model_memory = sum(module_size for module_size, _, _, _ in raw_block_list)
     remaining_model_bytes = total_model_memory
 
@@ -639,7 +722,8 @@ def calculate_fraction_from_byte_expert_string(model_patcher, byte_str):
 
 def calculate_fraction_from_ratio_expert_string(model_patcher, ratio_str):
     """Convert ratio allocation string (e.g. 'cuda:0,25%;cpu,75%') describing model split to fractional VRAM allocation string."""
-    raw_block_list = model_patcher._load_list()
+    raw_block_list_raw = model_patcher._load_list()
+    raw_block_list = [_load_list_item4(x) for x in raw_block_list_raw]
     total_model_memory = sum(module_size for module_size, _, _, _ in raw_block_list)
 
     raw_ratios = {}
